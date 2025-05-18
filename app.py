@@ -284,7 +284,7 @@ def assign_and_merge_zone_intervals(df, start_col='group_first', label_col='Inte
 
 # === RUN ===
 if __name__ == "__main__":
-    app.run_server(debug=False)
+    app.run(debug=False)
 
 
 
