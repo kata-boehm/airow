@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 # === DASH APP SETUP ===
 app = Dash(__name__)
 app.title = "Bike Data Annotator"
+server = app.server
 
 # === LAYOUT ===
 app.layout = html.Div([
