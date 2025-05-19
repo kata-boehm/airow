@@ -8,7 +8,7 @@ from dash.dcc import send_data_frame
 
 # === DASH APP SETUP ===
 app = Dash(__name__)
-app.title = "Bike Data Annotator"
+app.title = "Data Annotator"
 
 # === LAYOUT ===
 app.layout = html.Div([
