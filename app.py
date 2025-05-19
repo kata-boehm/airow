@@ -1,10 +1,10 @@
 import pandas as pd
 import numpy as np
 import io
-import os
 import base64
 from dash import Dash, dcc, html, Input, Output, State, ctx, dash_table
 import plotly.graph_objects as go
+from dash.dcc import send_data_frame
 
 # === DASH APP SETUP ===
 app = Dash(__name__)
@@ -14,14 +14,19 @@ app.title = "Bike Data Annotator"
 app.layout = html.Div([
     dcc.Store(id="uploaded-filename", data="uploaded_file"),
     dcc.Store(id="uploaded-contents", data=None),
+    dcc.Store(id="selected-store", data=[]),
+    dcc.Store(id="processed-df-store"),  # <-- NEU: Store für DataFrame
+
     html.Div(id="click-output"),
+
     html.Button("Download Selected Timestamps", id="export-button", disabled=True),
     dcc.Download(id="download-file"),
-    html.H2("\ud83d\udcc8 Interactive Time Series Annotator with Power Zones"),
+
+    html.H2("📈 Interactive Time Series Annotator with Power Zones"),
 
     dcc.Upload(
         id="upload-data",
-        children=html.Div(["\ud83d\udcc2 Drag and Drop or Click to Upload CSV"]),
+        children=html.Div(["📂 Drag and Drop or Click to Upload CSV"]),
         style={
             "width": "100%", "height": "60px", "lineHeight": "60px",
             "borderWidth": "1px", "borderStyle": "dashed",
@@ -40,6 +45,12 @@ app.layout = html.Div([
         dcc.Input(id="watt-threshold-input", type="number", value=20, min=1, max=100, step=1),
     ], style={"marginBottom": "10px", "display": "flex", "gap": "20px"}),
 
+    # ✅ Neue Button-Zeile für "Labels Modell"
+    html.Div([
+        html.Button("Labels Modell", id="model-labels-button"),
+        dcc.Download(id="download-model-labels")
+    ], style={"marginBottom": "10px"}),
+
     dcc.Graph(id="timeseries-plot", config={"displayModeBar": True, "scrollZoom": True}),
 
     html.H4("Selected Timestamps:"),
@@ -53,14 +64,9 @@ app.layout = html.Div([
         editable=False,
         row_deletable=True,
     ),
-
-    dcc.Store(id="selected-store", data=[]),
 ])
 
-# === CALLBACK ===
-from dash import ctx
-from dash.dcc import send_data_frame
-
+# === CALLBACK für Hauptfunktion ===
 @app.callback(
     Output("timeseries-plot", "figure"),
     Output("export-button", "disabled"),
@@ -68,8 +74,9 @@ from dash.dcc import send_data_frame
     Output("selected-store", "data"),
     Output("download-file", "data"),
     Output("click-output", "children"),
+    Output("processed-df-store", "data"),  # ✅ Neuer Output
     Input("upload-data", "contents"),
-    Input("upload-data", "filename"),  # ✅ real filename now
+    Input("upload-data", "filename"),
     Input("ftp-input", "value"),
     Input("watt-threshold-input", "value"),
     Input("timeseries-plot", "clickData"),
@@ -80,42 +87,35 @@ from dash.dcc import send_data_frame
 )
 def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_threshold_value, clickData, n_clicks,
                                   current_table, selected_store):
-
-
     if contents is None:
-        return {}, True, [], [], None, ""
+        return {}, True, [], [], None, "", None
 
-    # === Load and process uploaded CSV ===
     content_type, content_string = contents.split(',')
     decoded = base64.b64decode(content_string)
     df = pd.read_csv(io.StringIO(decoded.decode("utf-8")))
 
     if "timestamp" not in df.columns or "power" not in df.columns:
-        return {}, True, [], [], None, "Missing required columns."
+        return {}, True, [], [], None, "Missing required columns.", None
 
     df = process_csv_df(df, ftp=ftp_value, watt_drop=watt_threshold_value)
     df = detect_and_enforce_intervals(df)
     df = assign_and_merge_zone_intervals(df)
 
-    # === Determine what triggered the callback ===
     triggered = ctx.triggered_id
     updated_points = current_table.copy() if current_table else []
 
     if triggered == "timeseries-plot" and clickData:
         timestamp_clicked = clickData["points"][0]["x"]
         y_clicked = clickData["points"][0]["y"]
-
         if any(p["timestamp"] == timestamp_clicked for p in updated_points):
             updated_points = [p for p in updated_points if p["timestamp"] != timestamp_clicked]
         else:
             updated_points.append({"timestamp": timestamp_clicked, "y_value": y_clicked})
 
-    # Always relabel
     updated_points = sorted(updated_points, key=lambda x: x["timestamp"])
     for i, point in enumerate(updated_points):
         point["label"] = i + 1
 
-    # === Build Plot ===
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
@@ -139,7 +139,6 @@ def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_t
     for _, group in df.groupby((df["interval_zone_type"] != df["interval_zone_type"].shift()).cumsum()):
         zone = group["interval_zone_type"].iloc[0]
         color = color_map.get(zone, "gray")
-
         fig.add_trace(go.Scatter(
             x=group["timestamp"],
             y=group["power_roll_avg"],
@@ -157,7 +156,6 @@ def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_t
             lambda ts: df.loc[df["timestamp"] == ts, "power_roll_avg"].values[0]
             if ts in df["timestamp"].values else None
         )
-
         fig.add_trace(go.Scatter(
             x=selected_df["timestamp"],
             y=selected_df["y_value"],
@@ -178,29 +176,35 @@ def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_t
 
     fig.update_layout(title="Power Zone Visualization", xaxis_title="Time", yaxis_title="Power")
 
-    # === Export logic ===
     export_disabled = False if updated_points else True
     table_data = [{"label": p["label"], "timestamp": p["timestamp"]} for p in updated_points]
     download_data = None
 
     if triggered == "export-button" and updated_points:
         df_export = pd.DataFrame(updated_points)[["label", "timestamp"]]
-        if uploaded_filename and uploaded_filename.lower().endswith(".csv"):
-            base_name = uploaded_filename[:-4]
-        else:
-            base_name = uploaded_filename or "export"
+        base_name = uploaded_filename[:-4] if uploaded_filename and uploaded_filename.lower().endswith(".csv") else uploaded_filename or "export"
         export_name = f"{base_name}_labelled.csv"
         download_data = send_data_frame(df_export.to_csv, export_name, index=False)
 
-    message = ""
+    return fig, export_disabled, table_data, updated_points, download_data, "", df.to_json(date_format='iso')
 
-    return fig, export_disabled, table_data, updated_points, download_data, message
-
-
+# === NEUER CALLBACK für "Labels Modell" ===
+@app.callback(
+    Output("download-model-labels", "data"),
+    Input("model-labels-button", "n_clicks"),
+    State("processed-df-store", "data"),
+    prevent_initial_call=True
+)
+def export_model_labels(n_clicks, stored_df_json):
+    if not stored_df_json:
+        return None
+    df = pd.read_json(stored_df_json)
+    df = df[df["final_group_start"] == True]
+    return send_data_frame(df[["timestamp", "interval_group_id"]].to_csv, "model_labels.csv", index=False)
 
 # === SUPPORTING FUNCTIONS ===
-def process_csv_df(df, ftp, seven_zone_model=False, window_size=3, use_roll_avg=True,
-                   watt_drop=20, extend_gradient=True):
+def process_csv_df(df, ftp, seven_zone_model=True, window_size=5, use_roll_avg=True,
+                   watt_drop=20, extend_gradient=False):
     df = df.copy()
     df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
     df = df.sort_values('timestamp').reset_index(drop=True)
@@ -287,6 +291,3 @@ def assign_and_merge_zone_intervals(df, start_col='group_first', label_col='Inte
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
-
-
-
