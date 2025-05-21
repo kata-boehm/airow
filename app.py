@@ -95,17 +95,33 @@ def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_t
     decoded = base64.b64decode(content_string)
     df = pd.read_csv(io.StringIO(decoded.decode("utf-8")))
 
-    if "timestamp" not in df.columns or "power" not in df.columns:
-        return {}, True, [], [], None, "Missing required columns.", None
+    if "timestamp" not in df.columns:
+        return {}, True, [], [], None, "Missing required column: 'timestamp'", None
 
-    df = process_csv_df(df, ftp=ftp_value, watt_drop=watt_threshold_value)
-    df = group_true_values(df)
-    df = enforce_consecutive_intervals(df)
-    df = assign_dominant_zone_type_per_interval(df)
-    df = merge_consecutive_same_zone_intervals(df)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], format="mixed", errors="coerce")
+
+    # Only process if needed
+    if "interval_zone_type" not in df.columns:
+        if "power" not in df.columns:
+            return {}, True, [], [], None, "Missing required column: 'power'", None
+
+        df = process_csv_df(df, ftp=ftp_value, watt_drop=watt_threshold_value)
+        df = group_true_values(df)
+        df = enforce_consecutive_intervals(df)
+        df = assign_dominant_zone_type_per_interval(df)
+        df = merge_consecutive_same_zone_intervals(df)
+
+    # Check for pre-existing Manual_Timestamps column
+    manual_timestamps = []
+    if "Manual_Timestamps" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], format="mixed", errors="coerce")
+        manual_timestamps = df.loc[df["Manual_Timestamps"] == True, "timestamp"].dropna().dt.floor("S").tolist()
 
     triggered = ctx.triggered_id
-    updated_points = current_table.copy() if current_table else []
+    if triggered == "upload-data" and manual_timestamps:
+        updated_points = [{"timestamp": ts, "y_value": None} for ts in manual_timestamps]
+    else:
+        updated_points = current_table.copy() if current_table else []
 
     if triggered == "timeseries-plot" and clickData:
         timestamp_clicked = clickData["points"][0]["x"]
@@ -180,14 +196,25 @@ def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_t
     fig.update_layout(title="Power Zone Visualization", xaxis_title="Time", yaxis_title="Power")
 
     export_disabled = False if updated_points else True
-    table_data = [{"label": p["label"], "timestamp": p["timestamp"]} for p in updated_points]
+    # Format timestamps for display
+    for p in updated_points:
+        p["timestamp_display"] = pd.to_datetime(p["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
+
+    table_data = [{"label": p["label"], "timestamp": p["timestamp_display"]} for p in updated_points]
+
     download_data = None
 
     if triggered == "export-button" and updated_points:
-        df_export = pd.DataFrame(updated_points)[["label", "timestamp"]]
-        base_name = uploaded_filename[:-4] if uploaded_filename and uploaded_filename.lower().endswith(".csv") else uploaded_filename or "export"
-        export_name = f"{base_name}_labelled.csv"
-        download_data = send_data_frame(df_export.to_csv, export_name, index=False)
+        timestamps_to_mark = pd.to_datetime([p["timestamp"] for p in updated_points])
+        df["Manual_Timestamps"] = df["timestamp"].dt.floor("S").isin(timestamps_to_mark.floor("S"))
+
+        if uploaded_filename and uploaded_filename.lower().endswith(".csv"):
+            base_name = uploaded_filename[:-4]
+        else:
+            base_name = uploaded_filename or "export"
+
+        export_name = f"{base_name}_with_manual_labels.csv"
+        download_data = send_data_frame(df.to_csv, export_name, index=False)
 
     return fig, export_disabled, table_data, updated_points, download_data, "", df.to_json(date_format='iso')
 
