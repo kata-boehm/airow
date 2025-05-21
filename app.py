@@ -115,7 +115,7 @@ def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_t
     manual_timestamps = []
     if "Manual_Timestamps" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], format="mixed", errors="coerce")
-        manual_timestamps = df.loc[df["Manual_Timestamps"] == True, "timestamp"].dropna().dt.floor("S").tolist()
+        manual_timestamps = df.loc[df["Manual_Timestamps"] == True, "timestamp"].dropna().dt.floor("s").tolist()
 
     triggered = ctx.triggered_id
     if triggered == "upload-data" and manual_timestamps:
@@ -206,7 +206,7 @@ def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_t
 
     if triggered == "export-button" and updated_points:
         timestamps_to_mark = pd.to_datetime([p["timestamp"] for p in updated_points])
-        df["Manual_Timestamps"] = df["timestamp"].dt.floor("S").isin(timestamps_to_mark.floor("S"))
+        df["Manual_Timestamps"] = df["timestamp"].dt.floor("s").isin(timestamps_to_mark.floor("s"))
 
         if uploaded_filename and uploaded_filename.lower().endswith(".csv"):
             base_name = uploaded_filename[:-4]
