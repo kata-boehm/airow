@@ -40,7 +40,7 @@ app.layout = html.Div([
 
     html.Div([
         html.Label("FTP (Functional Threshold Power):"),
-        dcc.Input(id="ftp-input", type="number", value=250, min=50, max=1000, step=1),
+        dcc.Input(id="ftp-input", type="number", value=250, min=50, max=1000, step=5),
 
         html.Label("Watt Threshold:"),
         dcc.Input(id="watt-threshold-input", type="number", value=20, min=1, max=100, step=1),
@@ -99,8 +99,10 @@ def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_t
         return {}, True, [], [], None, "Missing required columns.", None
 
     df = process_csv_df(df, ftp=ftp_value, watt_drop=watt_threshold_value)
-    df = detect_and_enforce_intervals(df)
-    df = assign_and_merge_zone_intervals(df)
+    df = group_true_values(df)
+    df = enforce_consecutive_intervals(df)
+    df = assign_dominant_zone_type_per_interval(df)
+    df = merge_consecutive_same_zone_intervals(df)
 
     triggered = ctx.triggered_id
     updated_points = current_table.copy() if current_table else []
@@ -259,33 +261,101 @@ def process_csv_df(df, ftp, seven_zone_model=True, window_size=5, use_roll_avg=T
     df['Interval_Type'] = df['Power_Zone'].astype(str)
     return df
 
-def detect_and_enforce_intervals(df, start_column='interval_start_candidate', end_column='interval_end_candidate'):
-    df = df.copy()
-    group_start = (df[start_column] & ~df[start_column].shift(1, fill_value=False))
-    group_end = (df[end_column] & ~df[end_column].shift(-1, fill_value=False))
+
+def group_true_values(df, start_column='interval_start_candidate', end_column='interval_end_candidate'):
+    """Find the first and last timestamp of an interval"""
+
+    # Shifted versions for neighborhood check
+    prev1_end = df[start_column].shift(1, fill_value=False)
+    next1_end = df[end_column].shift(-1, fill_value=False)
+    prev2_end = df[start_column].shift(2, fill_value=False)
+    next2_end = df[end_column].shift(-2, fill_value=False)
+
+    # Identify groups of True values in the sequence
+    group_start = (df[start_column] == True) & (prev1_end == False) & (prev2_end == False)
+    group_end = (df[end_column] == True) & (next1_end == False) & (next2_end == False)
+
+    # Only keep the first occurrence of a group as True
     df['group_first'] = group_start
     df['group_last'] = group_end
-    df.loc[df.index[0], 'group_first'] = True
-    df.loc[df.index[-1], 'group_last'] = True
+
     return df
 
-def assign_dominant_zone_type(df, start_col='group_first', label_col='Interval_Type'):
+
+def enforce_consecutive_intervals(df, start_col='group_first', end_col='group_last'):
+    """Making sure intervals are consecutive: If an interval ends, another one must start the second after"""
+
     df = df.copy()
-    df[label_col] = df[label_col].fillna('Unclassified')
-    df['interval_group_id'] = df[start_col].cumsum()
-    dominant_zones = df.groupby('interval_group_id')[label_col].agg(lambda x: x.mode().iloc[0])
-    df['interval_zone_type'] = df['interval_group_id'].map(dominant_zones)
+
+    # Start: if previous row is a group_end → current row should be a group_start
+    prev_end = df[end_col].shift(1, fill_value=False)
+    df.loc[prev_end & (~df[start_col]), start_col] = True
+
+    # End: if next row is a group_start → current row should be a group_end
+    next_start = df[start_col].shift(-1, fill_value=False)
+    df.loc[next_start & (~df[end_col]), end_col] = True
+
+    # Force the very first row to be a start
+    df.loc[df.index[0], start_col] = True
+
+    # Force the very last row to be an end
+    df.loc[df.index[-1], end_col] = True
+
     return df
 
-def assign_and_merge_zone_intervals(df, start_col='group_first', label_col='Interval_Type'):
-    df = assign_dominant_zone_type(df, start_col=start_col, label_col=label_col)
+
+def assign_dominant_zone_type_per_interval(df, start_col='group_first', label_col='Interval_Type'):
+    """Classify per detected interval zone"""
+
+    df = df.copy()
+    df[label_col] = df[label_col].replace({np.nan: 'Unclassified', 'nan': 'Unclassified'})
+
+    # Assign a group ID to each interval based on cumulative sum of start flags
+    df['interval_group_id'] = df[start_col].cumsum()
+
+    # Find the most frequent zone in each group
+    dominant_zones = (
+        df.groupby('interval_group_id')[label_col]
+        .agg(lambda x: x.value_counts().idxmax())
+        .rename('interval_zone_type')
+    )
+
+    # Merge the result back to the original DataFrame
+    df = df.merge(dominant_zones, left_on='interval_group_id', right_index=True)
+
+    return df
+
+
+def merge_consecutive_same_zone_intervals(df):
+    """If consecutive intervals have same zone classification, they get merged as one."""
+
+    df = df.copy()
     df = df.sort_values(by='timestamp').reset_index(drop=True)
+
+    # Detect zone changes from row to row
     zone_change = (df['interval_zone_type'] != df['interval_zone_type'].shift()).astype(int)
+
+    # New group ID is just cumulative sum of changes
     df['interval_group_id'] = zone_change.cumsum()
-    new_zones = df.groupby('interval_group_id')['interval_zone_type'].agg(lambda x: x.mode().iloc[0])
+
+    # Re-assign interval_zone_type per new group (ensures consistent label)
+    new_zones = (
+        df.groupby('interval_group_id')['interval_zone_type']
+        .agg(lambda x: x.value_counts().idxmax())
+    )
     df['interval_zone_type'] = df['interval_group_id'].map(new_zones)
-    df['final_group_start'] = df['interval_group_id'] != df['interval_group_id'].shift().fillna(-1)
-    df['final_group_end'] = df['interval_group_id'] != df['interval_group_id'].shift(-1).fillna(-1)
+
+    # Initialize new columns
+    df['final_group_start'] = False
+    df['final_group_end'] = False
+
+    # Mark first and last index of each group
+    group_indices = df.groupby('interval_group_id').agg(first_idx=('timestamp', 'idxmin'),
+                                                        last_idx=('timestamp', 'idxmax'))
+
+    df.loc[group_indices['first_idx'], 'final_group_start'] = True
+    df.loc[group_indices['last_idx'], 'final_group_end'] = True
+
     return df
 
 # === RUN ===
