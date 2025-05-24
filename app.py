@@ -40,7 +40,7 @@ app.layout = html.Div([
 
     html.Div([
         html.Label("FTP (Functional Threshold Power):"),
-        dcc.Input(id="ftp-input", type="number", value=250, min=50, max=1000, step=5),
+        dcc.Input(id="ftp-input", type="number", value=230, min=50, max=1000, step=5),
 
         html.Label("Watt Threshold:"),
         dcc.Input(id="watt-threshold-input", type="number", value=20, min=1, max=100, step=1),
