@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from datetime import timedelta
 import io
 import os
 import base64
@@ -43,7 +44,7 @@ app.layout = html.Div([
         dcc.Input(id="ftp-input", type="number", value=230, min=50, max=1000, step=5),
 
         html.Label("Watt Threshold:"),
-        dcc.Input(id="watt-threshold-input", type="number", value=20, min=1, max=100, step=1),
+        dcc.Input(id="watt-threshold-input", type="number", value=11, min=1, max=50, step=1),
     ], style={"marginBottom": "10px", "display": "flex", "gap": "20px"}),
 
     # ✅ Neue Button-Zeile für "Labels Modell"
@@ -106,10 +107,14 @@ def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_t
             return {}, True, [], [], None, "Missing required column: 'power'", None
 
         df = process_csv_df(df, ftp=ftp_value, watt_drop=watt_threshold_value)
+        df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
         df = group_true_values(df)
         df = enforce_consecutive_intervals(df)
         df = assign_dominant_zone_type_per_interval(df)
         df = merge_consecutive_same_zone_intervals(df)
+        df = detect_and_invalidate_stop_resume_events(df)
+        df = merge_short_intervals(df)
+        df = reassign_first_n_seconds(df, seconds=60)
 
     # Check for pre-existing Manual_Timestamps column
     manual_timestamps = []
@@ -234,7 +239,7 @@ def export_model_labels(n_clicks, stored_df_json):
 
 # === SUPPORTING FUNCTIONS ===
 def process_csv_df(df, ftp, seven_zone_model=True, window_size=5, use_roll_avg=True,
-                   watt_drop=20, extend_gradient=False):
+                   watt_drop=11, extend_gradient=True):
     df = df.copy()
     df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
     df = df.sort_values('timestamp').reset_index(drop=True)
@@ -250,33 +255,57 @@ def process_csv_df(df, ftp, seven_zone_model=True, window_size=5, use_roll_avg=T
     df['interval_start_candidate'] = (df['power_derivative'] > power_slope_threshold).fillna(False)
     df['interval_end_candidate'] = (df['power_derivative'] < -power_slope_threshold).fillna(False)
 
+    # Extend confirmed_interval_start backward where the gradient is still positive (ajustable 'extend_gradient')
     if extend_gradient:
+
+        # Extend interval_start_candidate backward if avg gradient in prior 5s is still positive
         df['extended_start'] = False
         in_interval = False
-        for i in df.index[::-1]:
+        for i in df.index[::-1]:  # reverse loop
             if df.at[i, 'interval_start_candidate']:
                 in_interval = True
-            elif in_interval and df.at[i, 'power_derivative'] > 0:
-                df.at[i, 'extended_start'] = True
-            else:
-                in_interval = False
+            elif in_interval:
+                current_time = df.at[i, 'timestamp']
+                past_time = current_time - timedelta(seconds=5)
 
+                past_segment = df[(df['timestamp'] >= past_time) & (df['timestamp'] < current_time)]
+                if not past_segment.empty and past_segment['power_derivative'].mean() > 0:
+                    df.at[i, 'extended_start'] = True
+                else:
+                    in_interval = False
+
+        # Extend interval_end_candidate forward where avg gradient in next 5s is still negative
         df['extended_end'] = False
         in_interval = False
         for i in df.index:
             if df.at[i, 'interval_end_candidate']:
                 in_interval = True
-            elif in_interval and df.at[i, 'power_derivative'] < 0:
-                df.at[i, 'extended_end'] = True
-            else:
-                in_interval = False
+            elif in_interval:
+                current_time = df.at[i, 'timestamp']
+                future_time = current_time + timedelta(seconds=10)
 
-        df['interval_start_candidate'] |= df['extended_start']
-        df['interval_end_candidate'] |= df['extended_end']
+                future_segment = df[(df['timestamp'] > current_time) & (df['timestamp'] <= future_time)]
+                if not future_segment.empty and future_segment['power_derivative'].mean() < 0:
+                    df.at[i, 'extended_end'] = True
+                else:
+                    in_interval = False
+
+        # Merge with original
+        df['interval_start_candidate'] = df['interval_start_candidate'] | df['extended_start']
+        df['interval_end_candidate'] = df['interval_end_candidate'] | df['extended_end']
+
+        # Optionally drop the temporary columns
         df.drop(columns=['extended_start', 'extended_end'], inplace=True)
 
     df['power_for_classification'] = df['power_roll_avg'] if use_roll_avg else df['power']
 
+    # Choose power data for classification
+    if use_roll_avg:
+        df['power_for_classification'] = df['power_roll_avg']
+    else:
+        df['power_for_classification'] = df['power']
+
+    # Power Zones
     if seven_zone_model:
         power_bins = [0, 55, 75, 90, 105, 120, 150, float('inf')]
         power_labels = ['Zone1', 'Zone2', 'Zone3', 'Zone4', 'Zone5', 'Zone6', 'Zone7']
@@ -285,13 +314,13 @@ def process_csv_df(df, ftp, seven_zone_model=True, window_size=5, use_roll_avg=T
         power_labels = ['Zone1', 'Zone2', 'Zone3', 'Zone4', 'Zone5', 'Zone6']
 
     df['Power_Zone'] = pd.cut(df['power_for_classification'] / ftp * 100, bins=power_bins, labels=power_labels)
+
     df['Interval_Type'] = df['Power_Zone'].astype(str)
+
     return df
 
 
 def group_true_values(df, start_column='interval_start_candidate', end_column='interval_end_candidate'):
-    """Find the first and last timestamp of an interval"""
-
     # Shifted versions for neighborhood check
     prev1_end = df[start_column].shift(1, fill_value=False)
     next1_end = df[end_column].shift(-1, fill_value=False)
@@ -310,8 +339,6 @@ def group_true_values(df, start_column='interval_start_candidate', end_column='i
 
 
 def enforce_consecutive_intervals(df, start_col='group_first', end_col='group_last'):
-    """Making sure intervals are consecutive: If an interval ends, another one must start the second after"""
-
     df = df.copy()
 
     # Start: if previous row is a group_end → current row should be a group_start
@@ -332,8 +359,6 @@ def enforce_consecutive_intervals(df, start_col='group_first', end_col='group_la
 
 
 def assign_dominant_zone_type_per_interval(df, start_col='group_first', label_col='Interval_Type'):
-    """Classify per detected interval zone"""
-
     df = df.copy()
     df[label_col] = df[label_col].replace({np.nan: 'Unclassified', 'nan': 'Unclassified'})
 
@@ -354,8 +379,6 @@ def assign_dominant_zone_type_per_interval(df, start_col='group_first', label_co
 
 
 def merge_consecutive_same_zone_intervals(df):
-    """If consecutive intervals have same zone classification, they get merged as one."""
-
     df = df.copy()
     df = df.sort_values(by='timestamp').reset_index(drop=True)
 
@@ -385,6 +408,133 @@ def merge_consecutive_same_zone_intervals(df):
 
     return df
 
+def detect_and_invalidate_stop_resume_events(df, window_seconds=20, drop_threshold=100, recovery_margin=10):
+    """
+    Detects stop-resume events based on sudden power drops and quick recoveries,
+    and directly updates the DataFrame:
+    - Sets final_group_start and final_group_end to False within drop windows
+    - Reassigns interval_group_id and interval_zone_type to the last valid value before the drop
+    """
+    df = df.copy()
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df = df.dropna(subset=["power_roll_avg"])
+
+    power = df["power_roll_avg"].values
+    timestamps = df["timestamp"].values
+
+    for i in range(len(df) - window_seconds):
+        window_power = power[i:i + window_seconds]
+        window_time = timestamps[i:i + window_seconds]
+
+        pre_value = window_power[0]
+        min_idx = window_power.argmin()
+        min_value = window_power[min_idx]
+        post_value = window_power[-1]
+
+        drop = pre_value - min_value
+        recovered = abs(post_value - pre_value) <= recovery_margin
+
+        if drop >= drop_threshold and recovered and 1 < min_idx < window_seconds - 2:
+            start = window_time[0]  # already UTC-aware
+            end = window_time[-1]
+
+            mask = (df["timestamp"] >= start) & (df["timestamp"] <= end)
+
+            # Get last known interval metadata before the drop
+            prior = df[df["timestamp"] < start]
+            fill_zone = prior["interval_zone_type"].dropna().iloc[-1] if not prior["interval_zone_type"].dropna().empty else None
+            fill_group = prior["interval_group_id"].dropna().iloc[-1] if not prior["interval_group_id"].dropna().empty else None
+
+            df.loc[mask, "final_group_start"] = False
+            df.loc[mask, "final_group_end"] = False
+            df.loc[mask, "interval_group_id"] = fill_group
+            df.loc[mask, "interval_zone_type"] = fill_zone
+
+    return df
+
+
+def merge_short_intervals(df, min_duration_seconds=5):
+    """
+    Reassigns intervals shorter than min_duration_seconds to neighboring intervals
+    based on which neighbor has closer average power_roll_avg.
+    """
+    df = df.copy()
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    # Ensure group ID is consistent and not NaN
+    df["interval_group_id"] = df["interval_group_id"].ffill()
+
+    grouped = df.groupby("interval_group_id")
+
+    for group_id, group_df in grouped:
+        duration = (group_df["timestamp"].iloc[-1] - group_df["timestamp"].iloc[0]).total_seconds()
+        if duration >= min_duration_seconds:
+            continue  # skip long enough intervals
+
+        # Mean power of this short interval
+        this_mask = (df["timestamp"] >= group_df["timestamp"].iloc[0]) & (df["timestamp"] <= group_df["timestamp"].iloc[-1])
+        this_mean = group_df["power_roll_avg"].mean()
+
+        # 5 seconds before
+        before_mask = (df["timestamp"] < group_df["timestamp"].iloc[0]) & \
+                      (df["timestamp"] >= group_df["timestamp"].iloc[0] - pd.Timedelta(seconds=5))
+        before_mean = df.loc[before_mask, "power_roll_avg"].mean()
+        before_group = df.loc[before_mask, "interval_group_id"].dropna().iloc[-1] if not df.loc[before_mask].empty else None
+        before_zone = df.loc[before_mask, "interval_zone_type"].dropna().iloc[-1] if not df.loc[before_mask].empty else None
+
+        # 5 seconds after
+        after_mask = (df["timestamp"] > group_df["timestamp"].iloc[-1]) & \
+                     (df["timestamp"] <= group_df["timestamp"].iloc[-1] + pd.Timedelta(seconds=5))
+        after_mean = df.loc[after_mask, "power_roll_avg"].mean()
+        after_group = df.loc[after_mask, "interval_group_id"].dropna().iloc[0] if not df.loc[after_mask].empty else None
+        after_zone = df.loc[after_mask, "interval_zone_type"].dropna().iloc[0] if not df.loc[after_mask].empty else None
+
+        # Choose the closest in mean power
+        if pd.isna(before_mean) and pd.isna(after_mean):
+            continue  # nowhere to merge to
+
+        if pd.isna(before_mean):
+            assign_group, assign_zone = after_group, after_zone
+        elif pd.isna(after_mean):
+            assign_group, assign_zone = before_group, before_zone
+        else:
+            if abs(this_mean - before_mean) <= abs(this_mean - after_mean):
+                assign_group, assign_zone = before_group, before_zone
+            else:
+                assign_group, assign_zone = after_group, after_zone
+
+        # Apply reassignment
+        df.loc[this_mask, "interval_group_id"] = assign_group
+        df.loc[this_mask, "interval_zone_type"] = assign_zone
+        df.loc[this_mask, "final_group_start"] = False
+        df.loc[this_mask, "final_group_end"] = False
+
+    return df
+
+def reassign_first_n_seconds(df, seconds=30):
+    if df.empty:
+        return df
+
+    start_time = df["timestamp"].iloc[0]
+    cutoff_time = start_time + pd.Timedelta(seconds=seconds)
+
+    # Find first valid zone after cutoff
+    future_mask = df["timestamp"] > cutoff_time
+    valid_future = df.loc[future_mask & df["interval_zone_type"].notna()]
+    valid_future = valid_future[valid_future["interval_zone_type"] != "Unclassified"]
+
+    if valid_future.empty:
+        return df  # nothing to assign from
+
+    new_zone = valid_future.iloc[0]["interval_zone_type"]
+
+    # Apply reassignment
+    df.loc[df["timestamp"] <= cutoff_time, "interval_zone_type"] = new_zone
+    df.loc[valid_future.index[0], "final_group_start"] = False
+    df['interval_group_id'] = df['final_group_start'].cumsum()
+
+    return df
+    
 # === RUN ===
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
