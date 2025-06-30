@@ -49,6 +49,7 @@ app.layout = html.Div([
 
     # ✅ Neue Button-Zeile für "Labels Modell"
     html.Div([
+        html.Button("Detect Start Points", id="auto-detect-button", style={"marginRight": "10px"}),
         html.Button("Labels Modell", id="model-labels-button"),
         dcc.Download(id="download-model-labels")
     ], style={"marginBottom": "10px"}),
@@ -66,6 +67,7 @@ app.layout = html.Div([
         editable=False,
         row_deletable=True,
     ),
+
 ])
 
 # === CALLBACK für Hauptfunktion ===
@@ -76,7 +78,7 @@ app.layout = html.Div([
     Output("selected-store", "data"),
     Output("download-file", "data"),
     Output("click-output", "children"),
-    Output("processed-df-store", "data"),  # ✅ Neuer Output
+    Output("processed-df-store", "data"),
     Input("upload-data", "contents"),
     Input("upload-data", "filename"),
     Input("ftp-input", "value"),
@@ -84,11 +86,14 @@ app.layout = html.Div([
     Input("timeseries-plot", "clickData"),
     Input("export-button", "n_clicks"),
     Input("timestamp-table", "data"),
+    Input("auto-detect-button", "n_clicks"),  # <--- ADD THIS LINE
     State("selected-store", "data"),
     prevent_initial_call=True
 )
-def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_threshold_value, clickData, n_clicks,
-                                  current_table, selected_store):
+
+def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_threshold_value, clickData,
+                                  n_clicks, current_table, auto_detect_clicks, selected_store):
+
     if contents is None:
         return {}, True, [], [], None, "", None
 
@@ -115,6 +120,7 @@ def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_t
         df = detect_and_invalidate_stop_resume_events(df)
         df = merge_short_intervals(df)
         df = reassign_first_n_seconds(df, seconds=60)
+        df = merge_consecutive_same_zone_intervals(df)
 
     # Check for pre-existing Manual_Timestamps column
     manual_timestamps = []
@@ -123,10 +129,15 @@ def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_t
         manual_timestamps = df.loc[df["Manual_Timestamps"] == True, "timestamp"].dropna().dt.floor("s").tolist()
 
     triggered = ctx.triggered_id
+    updated_points = current_table.copy() if current_table else []
+
     if triggered == "upload-data" and manual_timestamps:
         updated_points = [{"timestamp": ts, "y_value": None} for ts in manual_timestamps]
-    else:
-        updated_points = current_table.copy() if current_table else []
+
+    elif triggered == "auto-detect-button":
+
+        start_times = df.loc[df["final_group_start"] == True, "timestamp"].dropna().dt.floor("s").tolist()
+        updated_points = [{"timestamp": ts, "y_value": None} for ts in start_times]
 
     if triggered == "timeseries-plot" and clickData:
         timestamp_clicked = clickData["points"][0]["x"]
