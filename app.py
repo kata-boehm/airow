@@ -17,7 +17,7 @@ app.layout = html.Div([
     dcc.Store(id="uploaded-filename", data="uploaded_file"),
     dcc.Store(id="uploaded-contents", data=None),
     dcc.Store(id="selected-store", data=[]),
-    dcc.Store(id="processed-df-store"),  # <-- NEU: Store für DataFrame
+    dcc.Store(id="processed-df-store"),
 
     html.Div(id="click-output"),
 
@@ -47,7 +47,6 @@ app.layout = html.Div([
         dcc.Input(id="watt-threshold-input", type="number", value=11, min=1, max=50, step=1),
     ], style={"marginBottom": "10px", "display": "flex", "gap": "20px"}),
 
-    # ✅ Neue Button-Zeile für "Labels Modell"
     html.Div([
         html.Button("Detect Start Points", id="auto-detect-button", style={"marginRight": "10px"}),
         html.Button("Labels Modell", id="model-labels-button"),
@@ -67,10 +66,120 @@ app.layout = html.Div([
         editable=False,
         row_deletable=True,
     ),
-
 ])
 
-# === CALLBACK für Hauptfunktion ===
+
+# === HELPER: FULL PROCESSING PIPELINE ===
+def process_full_pipeline(contents, ftp_value, watt_threshold_value):
+    """Process uploaded CSV through entire pipeline"""
+    content_type, content_string = contents.split(',')
+    decoded = base64.b64decode(content_string)
+    df = pd.read_csv(io.StringIO(decoded.decode("utf-8")))
+
+    if "timestamp" not in df.columns:
+        raise ValueError("Missing required column: 'timestamp'")
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], format="mixed", errors="coerce")
+
+    # Only process if needed
+    if "interval_zone_type" not in df.columns:
+        if "power" not in df.columns:
+            raise ValueError("Missing required column: 'power'")
+
+        df = process_csv_df(df, ftp=ftp_value, watt_drop=watt_threshold_value)
+        df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
+        df = group_true_values(df)
+        df = enforce_consecutive_intervals(df)
+        df = assign_dominant_zone_type_per_interval(df)
+        df = merge_consecutive_same_zone_intervals(df)
+        df = detect_and_invalidate_stop_resume_events(df)
+        df = merge_short_intervals(df)
+        df = reassign_first_n_seconds(df, seconds=60)
+        df = merge_consecutive_same_zone_intervals(df)
+
+    return df
+
+
+# === HELPER: BUILD FIGURE ===
+def build_figure(df, updated_points):
+    """Build the plotly figure from dataframe and selected points"""
+    fig = go.Figure()
+
+    # Add invisible click target layer
+    fig.add_trace(go.Scatter(
+        x=df['timestamp'],
+        y=df['power_roll_avg'],
+        mode="markers",
+        marker=dict(size=8, color='rgba(0,0,0,0.01)'),
+        name="Click Target",
+        hovertemplate="%{x|%H:%M:%S}<br>%{y:.0f} W",
+        visible=True,
+        showlegend=False,
+        opacity=0.5
+    ))
+
+    # Color map for zones
+    color_map = {
+        "Zone1": "#00008B", "Zone2": "#5dade2", "Zone3": "#229954",
+        "Zone4": "#f1c40f", "Zone5": "#e67e22", "Zone6": "#e74c3c", "Zone7": "#7b241c",
+        "Unclassified": "gray"
+    }
+
+    # Add colored segments for each zone
+    for _, group in df.groupby((df["interval_zone_type"] != df["interval_zone_type"].shift()).cumsum()):
+        zone = group["interval_zone_type"].iloc[0]
+        color = color_map.get(zone, "gray")
+        fig.add_trace(go.Scatter(
+            x=group["timestamp"],
+            y=group["power_roll_avg"],
+            mode="lines",
+            line=dict(color=color, width=2),
+            showlegend=False,
+            hoverinfo="skip"
+        ))
+
+    # Add selected points if any exist
+    if updated_points:
+        selected_df = pd.DataFrame(updated_points)
+        selected_df["timestamp"] = pd.to_datetime(selected_df["timestamp"], format="mixed", errors="coerce")
+        selected_df = selected_df.dropna(subset=["timestamp"])
+        
+        # Map timestamps to y-values from dataframe
+        selected_df["y_value"] = selected_df["timestamp"].apply(
+            lambda ts: df.loc[df["timestamp"] == ts, "power_roll_avg"].values[0]
+            if ts in df["timestamp"].values else None
+        )
+        
+        fig.add_trace(go.Scatter(
+            x=selected_df["timestamp"],
+            y=selected_df["y_value"],
+            mode="markers+text",
+            text=selected_df["label"],
+            textposition="top center",
+            marker=dict(color="black", size=10),
+            name="Selected Points"
+        ))
+
+    # Add legend entries for each zone
+    for zone, color in color_map.items():
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode='lines',
+            line=dict(color=color, width=3),
+            name=zone
+        ))
+
+    fig.update_layout(
+        title="Power Zone Visualization",
+        xaxis_title="Time",
+        yaxis_title="Power",
+        hovermode='closest'
+    )
+
+    return fig
+
+
+# === MAIN CALLBACK ===
 @app.callback(
     Output("timeseries-plot", "figure"),
     Output("export-button", "disabled"),
@@ -86,155 +195,114 @@ app.layout = html.Div([
     Input("timeseries-plot", "clickData"),
     Input("export-button", "n_clicks"),
     Input("timestamp-table", "data"),
-    Input("auto-detect-button", "n_clicks"),  # <--- ADD THIS LINE
+    Input("auto-detect-button", "n_clicks"),
     State("selected-store", "data"),
+    State("processed-df-store", "data"),
     prevent_initial_call=True
 )
-
-def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_threshold_value, clickData,
-                                  n_clicks, current_table, auto_detect_clicks, selected_store):
-
-    if contents is None:
-        return {}, True, [], [], None, "", None
-
-    content_type, content_string = contents.split(',')
-    decoded = base64.b64decode(content_string)
-    df = pd.read_csv(io.StringIO(decoded.decode("utf-8")))
-
-    if "timestamp" not in df.columns:
-        return {}, True, [], [], None, "Missing required column: 'timestamp'", None
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"], format="mixed", errors="coerce")
-
-    # Only process if needed
-    if "interval_zone_type" not in df.columns:
-        if "power" not in df.columns:
-            return {}, True, [], [], None, "Missing required column: 'power'", None
-
-        df = process_csv_df(df, ftp=ftp_value, watt_drop=watt_threshold_value)
-        df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
-        df = group_true_values(df)
-        df = enforce_consecutive_intervals(df)
-        df = assign_dominant_zone_type_per_interval(df)
-        df = merge_consecutive_same_zone_intervals(df)
-        df = detect_and_invalidate_stop_resume_events(df)
-        df = merge_short_intervals(df)
-        df = reassign_first_n_seconds(df, seconds=60)
-        df = merge_consecutive_same_zone_intervals(df)
-
-    # Check for pre-existing Manual_Timestamps column
-    manual_timestamps = []
-    if "Manual_Timestamps" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], format="mixed", errors="coerce")
-        manual_timestamps = df.loc[df["Manual_Timestamps"] == True, "timestamp"].dropna().dt.floor("s").tolist()
+def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_threshold_value,
+                                   clickData, export_clicks, current_table, auto_detect_clicks,
+                                   selected_store, stored_df_json):
 
     triggered = ctx.triggered_id
-    updated_points = current_table.copy() if current_table else []
-
-    if triggered == "upload-data" and manual_timestamps:
-        updated_points = [{"timestamp": ts, "y_value": None} for ts in manual_timestamps]
-
-    elif triggered == "auto-detect-button":
-
-        start_times = df.loc[df["final_group_start"] == True, "timestamp"].dropna().dt.floor("s").tolist()
-        updated_points = [{"timestamp": ts, "y_value": None} for ts in start_times]
-
-    if triggered == "timeseries-plot" and clickData:
-        timestamp_clicked = clickData["points"][0]["x"]
-        y_clicked = clickData["points"][0]["y"]
-        if any(p["timestamp"] == timestamp_clicked for p in updated_points):
-            updated_points = [p for p in updated_points if p["timestamp"] != timestamp_clicked]
-        else:
-            updated_points.append({"timestamp": timestamp_clicked, "y_value": y_clicked})
-
+    
+    # Determine if we need to reprocess the entire CSV
+    needs_reprocessing = triggered in ["upload-data", "ftp-input", "watt-threshold-input"]
+    
+    # === PATH 1: REPROCESS EVERYTHING ===
+    if needs_reprocessing:
+        if contents is None:
+            return {}, True, [], [], None, "", None
+        
+        try:
+            # Process the entire pipeline
+            df = process_full_pipeline(contents, ftp_value, watt_threshold_value)
+            
+            # Store as JSON using 'split' orientation for better performance
+            df_json = df.to_json(date_format='iso', orient='split')
+            
+            # Check for pre-existing Manual_Timestamps column
+            updated_points = []
+            if "Manual_Timestamps" in df.columns:
+                manual_timestamps = df.loc[df["Manual_Timestamps"] == True, "timestamp"].dropna().dt.floor("s")
+                updated_points = [{"timestamp": str(ts), "y_value": None, "label": i+1} 
+                                  for i, ts in enumerate(manual_timestamps)]
+            
+        except Exception as e:
+            return {}, True, [], [], None, f"Error: {str(e)}", None
+    
+    # === PATH 2: REUSE STORED DATA (FAST PATH) ===
+    else:
+        if stored_df_json is None:
+            return {}, True, [], [], None, "No data loaded", None
+        
+        # Read from stored JSON (much faster than reprocessing)
+        df = pd.read_json(stored_df_json, orient='split')
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df_json = stored_df_json  # Reuse without modification
+        
+        # Start with current table data or empty list
+        updated_points = current_table.copy() if current_table else []
+        
+        # Handle auto-detect button
+        if triggered == "auto-detect-button":
+            start_times = df.loc[df["final_group_start"] == True, "timestamp"].dropna().dt.floor("s")
+            updated_points = [{"timestamp": str(ts), "y_value": None} for ts in start_times]
+        
+        # Handle graph clicks (add/remove points)
+        elif triggered == "timeseries-plot" and clickData:
+            timestamp_clicked = clickData["points"][0]["x"]
+            y_clicked = clickData["points"][0]["y"]
+            
+            # Toggle: remove if exists, add if new
+            if any(p["timestamp"] == timestamp_clicked for p in updated_points):
+                updated_points = [p for p in updated_points if p["timestamp"] != timestamp_clicked]
+            else:
+                updated_points.append({"timestamp": timestamp_clicked, "y_value": y_clicked})
+        
+        # Handle row deletion from table
+        elif triggered == "timestamp-table":
+            # current_table already reflects deletions from the UI
+            updated_points = current_table
+    
+    # === COMMON PROCESSING FOR BOTH PATHS ===
+    
+    # Sort points by timestamp and assign labels
     updated_points = sorted(updated_points, key=lambda x: x["timestamp"])
     for i, point in enumerate(updated_points):
         point["label"] = i + 1
-
-    fig = go.Figure()
-
-    fig.add_trace(go.Scatter(
-        x=df['timestamp'],
-        y=df['power_roll_avg'],
-        mode="markers",
-        marker=dict(size=8, color='rgba(0,0,0,0.01)'),
-        name="Click Target",
-        hovertemplate="%{x|%H:%M:%S}<br>%{y:.0f} W",
-        visible=True,
-        showlegend=False,
-        opacity=0.5
-    ))
-
-    color_map = {
-        "Zone1": "#00008B", "Zone2": "#5dade2", "Zone3": "#229954",
-        "Zone4": "#f1c40f", "Zone5": "#e67e22", "Zone6": "#e74c3c", "Zone7": "#7b241c",
-        "Unclassified": "gray"
-    }
-
-    for _, group in df.groupby((df["interval_zone_type"] != df["interval_zone_type"].shift()).cumsum()):
-        zone = group["interval_zone_type"].iloc[0]
-        color = color_map.get(zone, "gray")
-        fig.add_trace(go.Scatter(
-            x=group["timestamp"],
-            y=group["power_roll_avg"],
-            mode="lines",
-            line=dict(color=color, width=2),
-            showlegend=False,
-            hoverinfo="skip"
-        ))
-
-    if updated_points:
-        selected_df = pd.DataFrame(updated_points)
-        selected_df["timestamp"] = pd.to_datetime(selected_df["timestamp"], format="mixed", errors="coerce")
-        selected_df = selected_df.dropna(subset=["timestamp"])
-        selected_df["y_value"] = selected_df["timestamp"].map(
-            lambda ts: df.loc[df["timestamp"] == ts, "power_roll_avg"].values[0]
-            if ts in df["timestamp"].values else None
-        )
-        fig.add_trace(go.Scatter(
-            x=selected_df["timestamp"],
-            y=selected_df["y_value"],
-            mode="markers+text",
-            text=selected_df["label"],
-            textposition="top center",
-            marker=dict(color="black", size=10),
-            name="Selected Points"
-        ))
-
-    for zone, color in color_map.items():
-        fig.add_trace(go.Scatter(
-            x=[None], y=[None],
-            mode='lines',
-            line=dict(color=color, width=3),
-            name=zone
-        ))
-
-    fig.update_layout(title="Power Zone Visualization", xaxis_title="Time", yaxis_title="Power")
-
-    export_disabled = False if updated_points else True
-    # Format timestamps for display
+    
+    # Build the figure
+    fig = build_figure(df, updated_points)
+    
+    # Prepare table data for display
+    table_data = []
     for p in updated_points:
-        p["timestamp_display"] = pd.to_datetime(p["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
-
-    table_data = [{"label": p["label"], "timestamp": p["timestamp_display"]} for p in updated_points]
-
+        timestamp_display = pd.to_datetime(p["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
+        table_data.append({"label": p["label"], "timestamp": timestamp_display})
+    
+    # Disable export button if no points selected
+    export_disabled = len(updated_points) == 0
+    
+    # Handle export
     download_data = None
-
     if triggered == "export-button" and updated_points:
         timestamps_to_mark = pd.to_datetime([p["timestamp"] for p in updated_points])
         df["Manual_Timestamps"] = df["timestamp"].dt.floor("s").isin(timestamps_to_mark.floor("s"))
-
+        
+        # Determine export filename
         if uploaded_filename and uploaded_filename.lower().endswith(".csv"):
             base_name = uploaded_filename[:-4]
         else:
             base_name = uploaded_filename or "export"
-
+        
         export_name = f"{base_name}_with_manual_labels.csv"
         download_data = send_data_frame(df.to_csv, export_name, index=False)
+    
+    return fig, export_disabled, table_data, updated_points, download_data, "", df_json
 
-    return fig, export_disabled, table_data, updated_points, download_data, "", df.to_json(date_format='iso')
 
-# === NEUER CALLBACK für "Labels Modell" ===
+# === CALLBACK: EXPORT MODEL LABELS ===
 @app.callback(
     Output("download-model-labels", "data"),
     Input("model-labels-button", "n_clicks"),
@@ -244,9 +312,12 @@ def update_graph_and_handle_click(contents, uploaded_filename, ftp_value, watt_t
 def export_model_labels(n_clicks, stored_df_json):
     if not stored_df_json:
         return None
-    df = pd.read_json(stored_df_json)
+    
+    df = pd.read_json(stored_df_json, orient='split')
     df = df[df["final_group_start"] == True]
+    
     return send_data_frame(df[["timestamp", "interval_group_id"]].to_csv, "model_labels.csv", index=False)
+
 
 # === SUPPORTING FUNCTIONS ===
 def process_csv_df(df, ftp, seven_zone_model=True, window_size=5, use_roll_avg=True,
@@ -266,9 +337,8 @@ def process_csv_df(df, ftp, seven_zone_model=True, window_size=5, use_roll_avg=T
     df['interval_start_candidate'] = (df['power_derivative'] > power_slope_threshold).fillna(False)
     df['interval_end_candidate'] = (df['power_derivative'] < -power_slope_threshold).fillna(False)
 
-    # Extend confirmed_interval_start backward where the gradient is still positive (ajustable 'extend_gradient')
+    # Extend confirmed_interval_start backward where the gradient is still positive
     if extend_gradient:
-
         # Extend interval_start_candidate backward if avg gradient in prior 5s is still positive
         df['extended_start'] = False
         in_interval = False
@@ -304,17 +374,10 @@ def process_csv_df(df, ftp, seven_zone_model=True, window_size=5, use_roll_avg=T
         # Merge with original
         df['interval_start_candidate'] = df['interval_start_candidate'] | df['extended_start']
         df['interval_end_candidate'] = df['interval_end_candidate'] | df['extended_end']
-
-        # Optionally drop the temporary columns
         df.drop(columns=['extended_start', 'extended_end'], inplace=True)
 
-    df['power_for_classification'] = df['power_roll_avg'] if use_roll_avg else df['power']
-
     # Choose power data for classification
-    if use_roll_avg:
-        df['power_for_classification'] = df['power_roll_avg']
-    else:
-        df['power_for_classification'] = df['power']
+    df['power_for_classification'] = df['power_roll_avg'] if use_roll_avg else df['power']
 
     # Power Zones
     if seven_zone_model:
@@ -325,7 +388,6 @@ def process_csv_df(df, ftp, seven_zone_model=True, window_size=5, use_roll_avg=T
         power_labels = ['Zone1', 'Zone2', 'Zone3', 'Zone4', 'Zone5', 'Zone6']
 
     df['Power_Zone'] = pd.cut(df['power_for_classification'] / ftp * 100, bins=power_bins, labels=power_labels)
-
     df['Interval_Type'] = df['Power_Zone'].astype(str)
 
     return df
@@ -419,6 +481,7 @@ def merge_consecutive_same_zone_intervals(df):
 
     return df
 
+
 def detect_and_invalidate_stop_resume_events(df, window_seconds=20, drop_threshold=100, recovery_margin=10):
     """
     Detects stop-resume events based on sudden power drops and quick recoveries,
@@ -446,7 +509,7 @@ def detect_and_invalidate_stop_resume_events(df, window_seconds=20, drop_thresho
         recovered = abs(post_value - pre_value) <= recovery_margin
 
         if drop >= drop_threshold and recovered and 1 < min_idx < window_seconds - 2:
-            start = window_time[0]  # already UTC-aware
+            start = window_time[0]
             end = window_time[-1]
 
             mask = (df["timestamp"] >= start) & (df["timestamp"] <= end)
@@ -522,6 +585,7 @@ def merge_short_intervals(df, min_duration_seconds=5):
 
     return df
 
+
 def reassign_first_n_seconds(df, seconds=30):
     if df.empty:
         return df
@@ -535,6 +599,7 @@ def reassign_first_n_seconds(df, seconds=30):
     valid_future = valid_future[valid_future["interval_zone_type"] != "Unclassified"]
 
     if valid_future.empty:
+
         return df  # nothing to assign from
 
     new_zone = valid_future.iloc[0]["interval_zone_type"]
@@ -545,7 +610,8 @@ def reassign_first_n_seconds(df, seconds=30):
     df['interval_group_id'] = df['final_group_start'].cumsum()
 
     return df
-    
+
+
 # === RUN ===
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
